@@ -649,7 +649,19 @@ function diffTrees(repo: Repo, baseTree: string | null, headTree: string | null)
 }
 // Three-way conflict test: both sides changed the same path differently from
 // the merge-base.
+// Pure function of two immutable commit oids (objects are content-addressed
+// and only ever added), so the result is safe to memoize. Keyed per repo.
+const conflictCache = new Map<string, boolean>();
 function hasMergeConflict(repo: Repo, baseOid: string, headOid: string): boolean {
+  const key = `${repo.id}|${baseOid}|${headOid}`;
+  const hit = conflictCache.get(key);
+  if (hit !== undefined) return hit;
+  const result = computeMergeConflict(repo, baseOid, headOid);
+  if (conflictCache.size >= 2048) conflictCache.clear();
+  conflictCache.set(key, result);
+  return result;
+}
+function computeMergeConflict(repo: Repo, baseOid: string, headOid: string): boolean {
   const mb = mergeBase(repo, baseOid, headOid);
   const baseTree = mb ? commitTree(repo, mb) : null;
   const curTree = commitTree(repo, baseOid);
@@ -688,11 +700,14 @@ function readBody(req: IncomingMessage): Promise<Buffer> {
 function sendJson(res: ServerResponse, status: number, value: unknown, extra?: Record<string, string>): void {
   sendJsonText(res, status, JSON.stringify(value), extra);
 }
-function sendJsonText(res: ServerResponse, status: number, body: string | Buffer, extra?: Record<string, string>): void {
+function sendJsonText(res: ServerResponse, status: number, bodyIn: string | Buffer, extra?: Record<string, string>): void {
+  // Encode once: a single Buffer gives the exact length and avoids a second
+  // UTF-8 pass inside res.end().
+  const body: Buffer = typeof bodyIn === 'string' ? Buffer.from(bodyIn, 'utf8') : bodyIn;
   const headers: Record<string, string> = {
     'content-type': 'application/json; charset=utf-8',
     // Explicit length: no chunked framing, the client can allocate exactly.
-    'content-length': String(typeof body === 'string' ? Buffer.byteLength(body) : body.length),
+    'content-length': String(body.length),
     'x-github-request-id': `req-${++requestSeq}`,
     'x-oauth-scopes': 'repo, read:org',
     ...(extra ?? {}),
@@ -1015,8 +1030,8 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, segments: s
       const tip = resolveRef(repo, ref);
       if (tip === undefined) return sendJson(res, 200, []);
       const walked = walkCommits(repo, [tip]);
-      const items = walked.map((oid) => commitJson(repo, oid)).filter((x): x is Record<string, unknown> => x !== null);
-      const { page, link } = paginate(items, query, baseUrl, path);
+      const { page: pageOids, link } = paginate(walked, query, baseUrl, path);
+      const page = pageOids.map((oid) => commitJson(repo, oid)).filter((x): x is Record<string, unknown> => x !== null);
       return sendJson(res, 200, page, link ? { link } : undefined);
     }
 
@@ -1221,7 +1236,8 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, segments: s
           else if (state === 'closed') list = list.filter((i) => i.state === 'closed');
           const direction = query.get('direction') ?? 'desc';
           list.sort((a, b) => (direction === 'asc' ? a.seq - b.seq : b.seq - a.seq));
-          const { page, link } = paginate(list.map((i) => issueJson(repo, i)), query, baseUrl, path);
+          const { page: pageIssues, link } = paginate(list, query, baseUrl, path);
+          const page = pageIssues.map((i) => issueJson(repo, i));
           return sendJson(res, 200, page, link ? { link } : undefined);
         }
         if (method === 'POST') {
@@ -1297,7 +1313,8 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, segments: s
           if (state === 'open') list = list.filter((p) => p.state === 'open');
           else if (state === 'closed') list = list.filter((p) => p.state === 'closed');
           list.sort((a, b) => b.seq - a.seq);
-          const { page, link } = paginate(list.map((p) => pullJson(repo, p)), query, baseUrl, path);
+          const { page: pagePulls, link } = paginate(list, query, baseUrl, path);
+          const page = pagePulls.map((p) => pullJson(repo, p));
           return sendJson(res, 200, page, link ? { link } : undefined);
         }
         if (method === 'POST') {
