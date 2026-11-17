@@ -337,6 +337,7 @@ interface Issue {
   labels: string[];
   seq: number;
   user: string;
+  nodeId: string;
 }
 interface IssueComment {
   id: number;
@@ -357,6 +358,7 @@ interface Pull {
   baseRef: string;
   baseSha: string;
   seq: number;
+  nodeId: string;
 }
 interface Repo {
   id: number;
@@ -368,14 +370,17 @@ interface Repo {
   objects: Map<string, GitObject>;
   refs: Map<string, string>;
   issues: Issue[];
+  issueByNumber: Map<number, Issue>;
   nextIssue: number;
   labels: Map<string, Label>;
   pulls: Pull[];
+  pullByNumber: Map<number, Pull>;
   nextPull: number;
   comments: Map<number, IssueComment[]>;
   nextCommentId: number;
   seq: number;
   viewVersion: number;
+  globalId: string;
   commitCache: Map<string, CommitInfo>;
   treeCache: Map<string, TreeEntry[]>;
 }
@@ -399,8 +404,9 @@ function getRepoById(id: number): Repo | undefined {
   return undefined;
 }
 function createRepo(owner: string, name: string, description: string, isPrivate: boolean): Repo {
+  const id = store.nextRepoId++;
   const repo: Repo = {
-    id: store.nextRepoId++,
+    id,
     owner,
     name,
     description,
@@ -409,14 +415,17 @@ function createRepo(owner: string, name: string, description: string, isPrivate:
     objects: new Map(),
     refs: new Map(),
     issues: [],
+    issueByNumber: new Map(),
     nextIssue: 1,
     labels: new Map(),
     pulls: [],
+    pullByNumber: new Map(),
     nextPull: 1,
     comments: new Map(),
     nextCommentId: 1,
     seq: ++store.seq,
     viewVersion: 0,
+    globalId: b64encode(`repo:${id}`),
     commitCache: new Map(),
     treeCache: new Map(),
   };
@@ -437,14 +446,16 @@ function viewerRepos(): Repo[] {
 }
 
 // Global ids: opaque, stable, never equal to the numeric database id.
+// Computed once when the entity is created (a base64 encode per response
+// is pure overhead on the read/write hot paths) and stored on the entity.
 function repoGlobalId(repo: Repo): string {
-  return b64encode(`repo:${repo.id}`);
+  return repo.globalId;
 }
 function issueGlobalId(repo: Repo, issue: Issue): string {
-  return b64encode(`issue:${repo.id}:${issue.number}`);
+  return issue.nodeId;
 }
 function pullGlobalId(repo: Repo, pull: Pull): string {
-  return b64encode(`pr:${repo.id}:${pull.number}`);
+  return pull.nodeId;
 }
 function commentGlobalId(repo: Repo, comment: IssueComment): string {
   return b64encode(`comment:${repo.id}:${comment.id}`);
@@ -707,6 +718,11 @@ interface ResLike {
   headersSent: boolean;
   writeHead(status: number, headers?: Record<string, string>): void;
   end(body?: Buffer | string): void;
+  // Fast terminal write: one prebuilt header block plus the body in a single
+  // socket.write (no header-object allocation, no writeHead loop).
+  // `headersText` is "name: value\r\n" lines without the status line, blank
+  // line or connection line; those are added here.
+  writeFull?: (status: number, headersText: string, body: Buffer) => void;
 }
 
 function sendJson(res: ResLike, status: number, value: unknown, extra?: Record<string, string>): void {
@@ -716,6 +732,15 @@ function sendJsonText(res: ResLike, status: number, bodyIn: string | Buffer, ext
   // Encode once: a single Buffer gives the exact length and avoids a second
   // UTF-8 pass inside res.end().
   const body: Buffer = typeof bodyIn === 'string' ? Buffer.from(bodyIn, 'utf8') : bodyIn;
+  // Fast path (no extra headers): one header string, corked head+body writes.
+  if (extra === undefined && res.writeFull !== undefined) {
+    res.writeFull(
+      status,
+      `content-type: application/json; charset=utf-8\r\ncontent-length: ${body.length}\r\nx-github-request-id: req-${++requestSeq}\r\nx-oauth-scopes: repo, read:org\r\n`,
+      body,
+    );
+    return;
+  }
   const headers: Record<string, string> = {
     'content-type': 'application/json; charset=utf-8',
     // Explicit length: no chunked framing, the client can allocate exactly.
@@ -934,24 +959,28 @@ function pullJson(repo: Repo, pull: Pull): Record<string, unknown> {
   };
 }
 function createIssueInternal(repo: Repo, title: string, body: string, labels: string[]): Issue {
+  const number = repo.nextIssue++;
   const issue: Issue = {
     id: store.nextIssueId++,
-    number: repo.nextIssue++,
+    number,
     title,
     body,
     state: 'open',
     labels,
     seq: ++store.seq,
     user: VIEWER_LOGIN,
+    nodeId: b64encode(`issue:${repo.id}:${number}`),
   };
   repo.issues.push(issue);
+  repo.issueByNumber.set(number, issue);
   repo.viewVersion++;
   return issue;
 }
 function createPullInternal(repo: Repo, title: string, body: string, headRef: string, headSha: string, baseRef: string, baseSha: string): Pull {
+  const number = repo.nextPull++;
   const pull: Pull = {
     id: store.nextPullId++,
-    number: repo.nextPull++,
+    number,
     title,
     body,
     state: 'open',
@@ -963,8 +992,10 @@ function createPullInternal(repo: Repo, title: string, body: string, headRef: st
     baseRef,
     baseSha,
     seq: ++store.seq,
+    nodeId: b64encode(`pr:${repo.id}:${number}`),
   };
   repo.pulls.push(pull);
+  repo.pullByNumber.set(number, pull);
   return pull;
 }
 function stripBranchPrefix(ref: string): string {
@@ -1298,7 +1329,7 @@ async function handleRest(req: ReqLike, res: ResLike, segments: string[], query:
       }
       const num = Number(rest[1]);
       if (!Number.isInteger(num) || num <= 0) return sendError(res, 404, 'Not Found');
-      const issue = repo.issues.find((i) => i.number === num);
+      const issue = repo.issueByNumber.get(num);
       if (issue === undefined) return sendError(res, 404, 'Not Found');
       if (rest.length === 2) {
         if (method === 'GET') return sendJsonText(res, 200, cachedIssueJson(repo, issue));
@@ -1384,7 +1415,7 @@ async function handleRest(req: ReqLike, res: ResLike, segments: string[], query:
       }
       const num = Number(rest[1]);
       if (!Number.isInteger(num) || num <= 0) return sendError(res, 404, 'Not Found');
-      const pull = repo.pulls.find((p) => p.number === num);
+      const pull = repo.pullByNumber.get(num);
       if (pull === undefined) return sendError(res, 404, 'Not Found');
       if (rest.length === 2) {
         if (method === 'GET') return sendJson(res, 200, pullJson(repo, pull));
@@ -1461,8 +1492,42 @@ function refsKey(repo: Repo): string {
 
 // ---------------------------------------------------------------- git smart HTTP
 function sendGit(res: ResLike, status: number, contentType: string, body: Buffer): void {
+  if (res.writeFull !== undefined) {
+    res.writeFull(status, `content-type: ${contentType}\r\ncontent-length: ${body.length}\r\n`, body);
+    return;
+  }
   res.writeHead(status, { 'content-type': contentType, 'content-length': String(body.length) });
   res.end(body);
+}
+// The three ref advertisements, each a cached pure function of the repo's
+// refs (v2 upload-pack carries no refs at all, so its body is one constant).
+// Shared by handleGit and the handleRequest fast path so the bytes can never
+// drift between the two routes.
+function advV2Upload(): Buffer {
+  return cachedResponse('adv-v2-upload', () =>
+    Buffer.concat([
+      pktLine('# service=git-upload-pack\n'),
+      FLUSH,
+      pktLine('version 2\n'),
+      pktLine('ls-refs=unborn\n'),
+      pktLine('fetch=shallow\n'),
+      pktLine(`agent=${AGENT}\n`),
+      pktLine('object-format=sha1\n'),
+      FLUSH,
+    ]),
+  );
+}
+function advV0Upload(repo: Repo): Buffer {
+  const caps = `symref=HEAD:refs/heads/main side-band-64k thin-pack ofs-delta multi_ack shallow agent=${AGENT}`;
+  return cachedResponse(`adv-v0-upload|${repo.id}|${refsKey(repo)}`, () =>
+    Buffer.concat([pktLine('# service=git-upload-pack\n'), FLUSH, ...refAdvertisementLines(repo, caps), FLUSH]),
+  );
+}
+function advV0Receive(repo: Repo): Buffer {
+  const caps = `symref=HEAD:refs/heads/main report-status report-status-v2 side-band-64k delete-refs ofs-delta agent=${AGENT}`;
+  return cachedResponse(`adv-v0-receive|${repo.id}|${refsKey(repo)}`, () =>
+    Buffer.concat([pktLine('# service=git-receive-pack\n'), FLUSH, ...refAdvertisementLines(repo, caps), FLUSH]),
+  );
 }
 function refAdvertisementLines(repo: Repo, caps: string): Buffer[] {
   const lines: string[] = [];
@@ -1619,8 +1684,36 @@ function sidebandPack(pack: Buffer): Buffer {
   }
   return Buffer.concat(parts);
 }
-function lsRefsResponse(repo: Repo, args: string[]): Buffer {
-  return cachedResponse(`lsrefs|${repo.id}|${refsKey(repo)}|${args.join('\n')}`, () => buildLsRefsResponse(repo, args));
+// The command line of a v2 upload-pack request, read off the first pkt-line
+// without parsing the whole body. Null when the first packet is not a
+// well-formed data packet: malformed input falls through to the full parser,
+// which returns the exact 400 the old code did.
+function v2Command(bodyBuf: Buffer): string | null {
+  if (bodyBuf.length < 5) return null;
+  const len = parseInt(bodyBuf.toString('ascii', 0, 4), 16);
+  if (!Number.isInteger(len) || len < 5 || 4 + len > bodyBuf.length) return null;
+  const line = bodyBuf.toString('utf8', 4, 4 + len).replace(/\n$/, '');
+  return line.startsWith('command=') ? line : null;
+}
+function v2Args(bodyBuf: Buffer): string[] {
+  const { packets } = parsePktLines(bodyBuf, 0);
+  const args: string[] = [];
+  let seenDelim = false;
+  for (const p of packets) {
+    if (p.kind === 'delim') {
+      seenDelim = true;
+      continue;
+    }
+    if (p.kind === 'data' && seenDelim) args.push((p.data as Buffer).toString('utf8').replace(/\n$/, ''));
+    if (p.kind === 'flush') break;
+  }
+  return args;
+}
+function lsRefsResponse(repo: Repo, bodyBuf: Buffer): Buffer {
+  // Key on the raw request bytes: the same bytes always parse to the same
+  // argument lines, so a cache hit needs no pkt-line parsing at all. The
+  // parse happens only on a miss, inside the builder.
+  return cachedResponse(`lsrefs|${repo.id}|${refsKey(repo)}|${bodyBuf.toString('latin1')}`, () => buildLsRefsResponse(repo, v2Args(bodyBuf)));
 }
 function buildLsRefsResponse(repo: Repo, args: string[]): Buffer {
   const peel = args.includes('peel');
@@ -1654,10 +1747,11 @@ function buildLsRefsResponse(repo: Repo, args: string[]): Buffer {
   parts.push(FLUSH);
   return Buffer.concat(parts);
 }
-function fetchV2Response(repo: Repo, args: string[]): Buffer {
+function fetchV2Response(repo: Repo, bodyBuf: Buffer): Buffer {
   // Pack contents depend only on the args and the object graph; objects are only
   // ever added, so the object count in the key makes any graph change a miss.
-  return cachedResponse(`fetch2|${repo.id}|${repo.objects.size}|${args.join('\n')}`, () => buildFetchV2Response(repo, args));
+  // Keyed on the raw request bytes (see lsRefsResponse): a hit skips parsing.
+  return cachedResponse(`fetch2|${repo.id}|${repo.objects.size}|${bodyBuf.toString('latin1')}`, () => buildFetchV2Response(repo, v2Args(bodyBuf)));
 }
 function buildFetchV2Response(repo: Repo, args: string[]): Buffer {
   const wants: string[] = [];
@@ -1737,32 +1831,12 @@ async function handleGit(req: ReqLike, res: ResLike, segments: string[], query: 
       const v2 = req.headers['git-protocol'] === 'version=2';
       if (v2) {
         // Constant: no refs, just capabilities.
-        const body = cachedResponse('adv-v2-upload', () =>
-          Buffer.concat([
-            pktLine('# service=git-upload-pack\n'),
-            FLUSH,
-            pktLine('version 2\n'),
-            pktLine('ls-refs=unborn\n'),
-            pktLine('fetch=shallow\n'),
-            pktLine(`agent=${AGENT}\n`),
-            pktLine('object-format=sha1\n'),
-            FLUSH,
-          ]),
-        );
-        return sendGit(res, 200, 'application/x-git-upload-pack-advertisement', body);
+        return sendGit(res, 200, 'application/x-git-upload-pack-advertisement', advV2Upload());
       }
-      const caps = `symref=HEAD:refs/heads/main side-band-64k thin-pack ofs-delta multi_ack shallow agent=${AGENT}`;
-      const body = cachedResponse(`adv-v0-upload|${repo.id}|${refsKey(repo)}`, () =>
-        Buffer.concat([pktLine('# service=git-upload-pack\n'), FLUSH, ...refAdvertisementLines(repo, caps), FLUSH]),
-      );
-      return sendGit(res, 200, 'application/x-git-upload-pack-advertisement', body);
+      return sendGit(res, 200, 'application/x-git-upload-pack-advertisement', advV0Upload(repo));
     }
     if (service === 'git-receive-pack') {
-      const caps = `symref=HEAD:refs/heads/main report-status report-status-v2 side-band-64k delete-refs ofs-delta agent=${AGENT}`;
-      const body = cachedResponse(`adv-v0-receive|${repo.id}|${refsKey(repo)}`, () =>
-        Buffer.concat([pktLine('# service=git-receive-pack\n'), FLUSH, ...refAdvertisementLines(repo, caps), FLUSH]),
-      );
-      return sendGit(res, 200, 'application/x-git-receive-pack-advertisement', body);
+      return sendGit(res, 200, 'application/x-git-receive-pack-advertisement', advV0Receive(repo));
     }
     return sendError(res, 400, 'service parameter is required');
   }
@@ -1770,31 +1844,31 @@ async function handleGit(req: ReqLike, res: ResLike, segments: string[], query: 
   // POST git-upload-pack
   if (method === 'POST' && sub.length === 1 && sub[0] === 'git-upload-pack') {
     const v2 = req.headers['git-protocol'] === 'version=2';
-    const { packets } = parsePktLines(bodyBuf, 0);
-    const lines = packets.filter((p) => p.kind === 'data').map((p) => (p.data as Buffer).toString('utf8').replace(/\n$/, ''));
-    if (lines.length === 0) return sendError(res, 400, 'empty request');
     if (v2) {
-      const commandLine = lines[0];
-      // Rebuild args from packets after the delim packet.
-      const afterDelim: string[] = [];
-      let seenDelim = false;
-      for (const p of packets) {
-        if (p.kind === 'delim') {
-          seenDelim = true;
-          continue;
-        }
-        if (p.kind === 'data' && seenDelim) afterDelim.push((p.data as Buffer).toString('utf8').replace(/\n$/, ''));
-        if (p.kind === 'flush') break;
+      // Fast path: a well-formed command line goes straight to the raw-body
+      // cache; only malformed or unknown commands pay for the full parse.
+      const command = v2Command(bodyBuf);
+      if (command === 'command=ls-refs') {
+        return sendGit(res, 200, 'application/x-git-upload-pack-result', lsRefsResponse(repo, bodyBuf));
       }
+      if (command === 'command=fetch') {
+        return sendGit(res, 200, 'application/x-git-upload-pack-result', fetchV2Response(repo, bodyBuf));
+      }
+      const { packets } = parsePktLines(bodyBuf, 0);
+      const lines = packets.filter((p) => p.kind === 'data').map((p) => (p.data as Buffer).toString('utf8').replace(/\n$/, ''));
+      if (lines.length === 0) return sendError(res, 400, 'empty request');
+      const commandLine = lines[0];
       if (commandLine === 'command=ls-refs') {
-        return sendGit(res, 200, 'application/x-git-upload-pack-result', lsRefsResponse(repo, afterDelim));
+        return sendGit(res, 200, 'application/x-git-upload-pack-result', lsRefsResponse(repo, bodyBuf));
       }
       if (commandLine === 'command=fetch') {
-        return sendGit(res, 200, 'application/x-git-upload-pack-result', fetchV2Response(repo, afterDelim));
+        return sendGit(res, 200, 'application/x-git-upload-pack-result', fetchV2Response(repo, bodyBuf));
       }
       return sendError(res, 400, 'unknown command');
     }
     // v0: two sections separated by flush packets.
+    const { packets } = parsePktLines(bodyBuf, 0);
+    if (!packets.some((p) => p.kind === 'data')) return sendError(res, 400, 'empty request');
     const sections: string[][] = [[], []];
     let sectionIdx = 0;
     for (const p of packets) {
@@ -2284,11 +2358,11 @@ function resolveField(node: GqlNode, field: GqlField, variables: Record<string, 
       if (repo === undefined) return null;
       if (decoded.kind === 'repo') return repoNode(repo);
       if (decoded.kind === 'issue') {
-        const issue = repo.issues.find((i) => i.number === decoded.num);
+        const issue = repo.issueByNumber.get(decoded.num);
         return issue === undefined ? null : issueNode(repo, issue);
       }
       if (decoded.kind === 'pr') {
-        const pull = repo.pulls.find((p) => p.number === decoded.num);
+        const pull = repo.pullByNumber.get(decoded.num);
         return pull === undefined ? null : pullNode(repo, pull);
       }
       return null;
@@ -2323,7 +2397,7 @@ function resolveField(node: GqlNode, field: GqlField, variables: Record<string, 
       const decoded = decodeGlobalId(String(input.issueId ?? ''));
       if (decoded === null || decoded.kind !== 'issue') throw new Error('Issue not found');
       const repo = getRepoById(decoded.repoId);
-      const issue = repo?.issues.find((i) => i.number === decoded.num);
+      const issue = repo?.issueByNumber.get(decoded.num);
       if (repo === undefined || issue === undefined) throw new Error('Issue not found');
       issue.state = 'closed';
       repo.viewVersion++;
@@ -2350,7 +2424,7 @@ function resolveField(node: GqlNode, field: GqlField, variables: Record<string, 
       const decoded = decodeGlobalId(String(input.pullRequestId ?? ''));
       if (decoded === null || decoded.kind !== 'pr') throw new Error('Pull request not found');
       const repo = getRepoById(decoded.repoId);
-      const pull = repo?.pulls.find((p) => p.number === decoded.num);
+      const pull = repo?.pullByNumber.get(decoded.num);
       if (repo === undefined || pull === undefined) throw new Error('Pull request not found');
       if (pull.merged || pull.state === 'closed') throw new Error('Pull request is already merged or closed');
       if (hasMergeConflict(repo, pull.baseSha, pull.headSha)) throw new Error('Merge conflict');
@@ -2370,7 +2444,7 @@ function resolveField(node: GqlNode, field: GqlField, variables: Record<string, 
       const decoded = decodeGlobalId(String(input.subjectId ?? ''));
       if (decoded === null || decoded.kind !== 'issue') throw new Error('Subject not found');
       const repo = getRepoById(decoded.repoId);
-      const issue = repo?.issues.find((i) => i.number === decoded.num);
+      const issue = repo?.issueByNumber.get(decoded.num);
       if (repo === undefined || issue === undefined) throw new Error('Issue not found');
       const comment: IssueComment = { id: repo.nextCommentId++, body: String(input.body ?? ''), user: VIEWER_LOGIN };
       const list = repo.comments.get(issue.number) ?? [];
@@ -2424,7 +2498,7 @@ function resolveField(node: GqlNode, field: GqlField, variables: Record<string, 
       case 'url':
         return `https://github.com/${repo.owner}/${repo.name}`;
       case 'issue': {
-        const issue = repo.issues.find((i) => i.number === Number(args.number ?? -1));
+        const issue = repo.issueByNumber.get(Number(args.number ?? -1));
         return issue === undefined ? null : issueNode(repo, issue);
       }
       case 'issues': {
@@ -2443,7 +2517,7 @@ function resolveField(node: GqlNode, field: GqlField, variables: Record<string, 
         return conn;
       }
       case 'pullRequest': {
-        const pull = repo.pulls.find((p) => p.number === Number(args.number ?? -1));
+        const pull = repo.pullByNumber.get(Number(args.number ?? -1));
         return pull === undefined ? null : pullNode(repo, pull);
       }
       case 'pullRequests': {
@@ -2886,7 +2960,7 @@ function callMcpTool(name: string, args: Record<string, unknown>): Record<string
     if (m !== null) return mcpToolFailure(m);
     const repo = getRepo(String(args.owner), String(args.repo));
     if (repo === undefined) return mcpToolFailure('Repository not found');
-    const pull = repo.pulls.find((p) => p.number === Number(args.pull_number));
+    const pull = repo.pullByNumber.get(Number(args.pull_number));
     if (pull === undefined) return mcpToolFailure('Pull request not found');
     if (pull.merged || pull.state === 'closed') return mcpToolFailure('Pull request is already merged or closed');
     if (hasMergeConflict(repo, pull.baseSha, pull.headSha)) return mcpToolFailure('Merge conflict');
@@ -2906,7 +2980,7 @@ function callMcpTool(name: string, args: Record<string, unknown>): Record<string
     if (m !== null) return mcpToolFailure(m);
     const repo = getRepo(String(args.owner), String(args.repo));
     if (repo === undefined) return mcpToolFailure('Repository not found');
-    const issue = repo.issues.find((i) => i.number === Number(args.issue_number));
+    const issue = repo.issueByNumber.get(Number(args.issue_number));
     if (issue === undefined) return mcpToolFailure('Issue not found');
     return mcpToolSuccess(issueJson(repo, issue));
   }
@@ -3011,6 +3085,106 @@ async function handleMcp(req: ReqLike, res: ResLike, bodyBuf: Buffer): Promise<v
 // ---------------------------------------------------------------- dispatcher
 // The transport hands us the whole body already read; handlers never wait
 // on a stream. Everything below runs synchronously to completion.
+//
+// Hot-path fast routes. The benchmark's shapes — one GET/POST issue and the
+// git advertisements — are exact-match dispatched here, skipping the segment
+// split, the generic handler chains and (for git) the query object. Every
+// condition is deliberately narrow: anything even slightly off-shape returns
+// false and the request falls through to the generic dispatcher unchanged,
+// so behaviour for all other inputs is byte-identical to before.
+function tryFastIssue(req: ReqLike, res: ResLike, bodyBuf: Buffer, pathname: string, method: string, qi: number): boolean {
+  if (qi >= 0 || pathname.includes('%') || !pathname.startsWith('/api/v3/repos/')) return false;
+  const rest = pathname.slice(14);
+  const s1 = rest.indexOf('/');
+  if (s1 <= 0) return false;
+  const owner = rest.slice(0, s1);
+  const s2 = rest.indexOf('/', s1 + 1);
+  if (s2 <= s1 + 1) return false;
+  const repoName = rest.slice(s1 + 1, s2);
+  const tail = rest.slice(s2 + 1);
+  if (method === 'GET') {
+    if (!tail.startsWith('issues/')) return false;
+    const numStr = tail.slice(7);
+    if (numStr.length === 0) return false;
+    for (let i = 0; i < numStr.length; i++) {
+      const c = numStr.charCodeAt(i);
+      if (c < 48 || c > 57) return false;
+    }
+    if (!isAuthorized(req)) {
+      sendError(res, 401, 'Requires authentication');
+      return true;
+    }
+    const repo = getRepo(owner, repoName);
+    if (repo === undefined) {
+      sendError(res, 404, 'Not Found');
+      return true;
+    }
+    const issue = repo.issueByNumber.get(Number(numStr));
+    if (issue === undefined) {
+      sendError(res, 404, 'Not Found');
+      return true;
+    }
+    sendJsonText(res, 200, cachedIssueJson(repo, issue));
+    return true;
+  }
+  if (method === 'POST') {
+    if (tail !== 'issues') return false;
+    if (!isAuthorized(req)) {
+      sendError(res, 401, 'Requires authentication');
+      return true;
+    }
+    const repo = getRepo(owner, repoName);
+    if (repo === undefined) {
+      sendError(res, 404, 'Not Found');
+      return true;
+    }
+    const parsed = parseJsonBody(bodyBuf);
+    if (!parsed.ok) {
+      sendError(res, 400, 'Problems parsing JSON');
+      return true;
+    }
+    const body = asRecord(parsed.value);
+    const title = asString(body.title);
+    if (title === undefined || title.length === 0) {
+      sendError(res, 422, 'title is required');
+      return true;
+    }
+    const labelNames: string[] = Array.isArray(body.labels) ? body.labels.filter((x): x is string => typeof x === 'string') : [];
+    for (const n of labelNames) {
+      if (!repo.labels.has(n)) {
+        sendError(res, 422, `Label does not exist: ${n}`);
+        return true;
+      }
+    }
+    const issue = createIssueInternal(repo, title, asString(body.body) ?? '', labelNames);
+    sendJsonText(res, 201, issueJsonText(repo, issue));
+    return true;
+  }
+  return false;
+}
+function tryFastAdvertisement(req: ReqLike, res: ResLike, pathname: string, method: string, qi: number, rawUrl: string): boolean {
+  if (method !== 'GET' || qi < 0 || pathname.includes('%') || !pathname.endsWith('.git/info/refs')) return false;
+  const qs = rawUrl.slice(qi + 1);
+  if (qs !== 'service=git-upload-pack' && qs !== 'service=git-receive-pack') return false;
+  const inner = pathname.slice(1, -10); // '{owner}/{repo}.git'
+  const slash = inner.indexOf('/');
+  if (slash <= 0 || !inner.endsWith('.git')) return false;
+  const owner = inner.slice(0, slash);
+  const repoName = inner.slice(slash + 1, -4);
+  if (repoName.length === 0 || repoName.includes('/')) return false;
+  const repo = getRepo(owner, repoName);
+  if (repo === undefined) return false; // fall through: the generic route 404s
+  if (qs === 'service=git-receive-pack') {
+    sendGit(res, 200, 'application/x-git-receive-pack-advertisement', advV0Receive(repo));
+    return true;
+  }
+  if (req.headers['git-protocol'] === 'version=2') {
+    sendGit(res, 200, 'application/x-git-upload-pack-advertisement', advV2Upload());
+    return true;
+  }
+  sendGit(res, 200, 'application/x-git-upload-pack-advertisement', advV0Upload(repo));
+  return true;
+}
 async function handleRequest(req: ReqLike, res: ResLike, bodyBuf: Buffer): Promise<void> {
   try {
     const method = req.method;
@@ -3039,6 +3213,8 @@ async function handleRequest(req: ReqLike, res: ResLike, bodyBuf: Buffer): Promi
       query = qi < 0 ? EMPTY_PARAMS : new URLSearchParams(rawUrl.slice(qi + 1));
     }
     if (pathname.length > 1 && pathname.endsWith('/')) pathname = pathname.slice(0, -1);
+    if (tryFastIssue(req, res, bodyBuf, pathname, method, qi)) return;
+    if (tryFastAdvertisement(req, res, pathname, method, qi, rawUrl)) return;
     const segments = pathname
       .split('/')
       .filter((s) => s.length > 0)
@@ -3147,6 +3323,24 @@ class RawResponse implements ResLike {
     }
     if (!this.keepAlive) this.sock.end();
   }
+  // One socket.write of head+body (the old end() shape): measured faster
+  // than cork()+two writes on this VM, where the corked flush costs more
+  // per sequential round-trip than copying a few hundred bytes once. The
+  // saving vs end() is upstream: the caller hands us a prebuilt header
+  // block, so there is no header-object allocation and no writeHead loop.
+  writeFull(status: number, headersText: string, body: Buffer): void {
+    if (this.ended) return;
+    this.ended = true;
+    this.headersSent = true;
+    const head = `${this.version} ${status} ${STATUS_TEXT[status] ?? ''}\r\n${headersText}connection: ${this.keepAlive ? 'keep-alive' : 'close'}\r\n\r\n`;
+    const headBuf = Buffer.from(head, 'ascii');
+    if (this.isHead || body.length === 0) {
+      this.sock.write(headBuf);
+    } else {
+      this.sock.write(Buffer.concat([headBuf, body]));
+    }
+    if (!this.keepAlive) this.sock.end();
+  }
 }
 
 interface PendingRequest {
@@ -3227,7 +3421,13 @@ function attachSocket(sock: Socket): void {
       const colon = line.indexOf(':');
       if (colon < 0) continue;
       const name = line.slice(0, colon).trim().toLowerCase();
-      const value = line.slice(colon + 1).trim();
+      // Values are "Name: value" from every client that talks to this forge;
+      // strip that one space directly instead of paying for trim() per header.
+      let value = line.slice(colon + 1);
+      if (value.charCodeAt(0) === 32) value = value.slice(1);
+      else value = value.trim();
+      const last = value.charCodeAt(value.length - 1);
+      if (last === 32 || last === 9) value = value.trimEnd();
       const prev = headers[name];
       headers[name] = prev === undefined ? value : `${prev}, ${value}`;
     }
