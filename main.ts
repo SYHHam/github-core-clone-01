@@ -24,6 +24,13 @@ const LABEL_SEED = ['bug', 'enhancement', 'documentation', 'question', 'good fir
 function sha1(data: Buffer): string {
   return createHash('sha1').update(data).digest('hex');
 }
+function sha1Header(type: string, data: Buffer): string {
+  // Hash header + payload without concatenating them first.
+  const h = createHash('sha1');
+  h.update(`${type} ${data.length}\0`, 'utf8');
+  h.update(data);
+  return h.digest('hex');
+}
 function isOid(s: string): boolean {
   return /^[0-9a-f]{40}$/.test(s);
 }
@@ -90,8 +97,7 @@ interface GitObject {
   data: Buffer;
 }
 function hashObject(type: ObjType, data: Buffer): string {
-  const header = Buffer.from(`${type} ${data.length}\0`, 'utf8');
-  return sha1(Buffer.concat([header, data]));
+  return sha1Header(type, data);
 }
 interface CommitInfo {
   tree: string;
@@ -682,11 +688,11 @@ function readBody(req: IncomingMessage): Promise<Buffer> {
 function sendJson(res: ServerResponse, status: number, value: unknown, extra?: Record<string, string>): void {
   sendJsonText(res, status, JSON.stringify(value), extra);
 }
-function sendJsonText(res: ServerResponse, status: number, body: string, extra?: Record<string, string>): void {
+function sendJsonText(res: ServerResponse, status: number, body: string | Buffer, extra?: Record<string, string>): void {
   const headers: Record<string, string> = {
     'content-type': 'application/json; charset=utf-8',
     // Explicit length: no chunked framing, the client can allocate exactly.
-    'content-length': String(Buffer.byteLength(body)),
+    'content-length': String(typeof body === 'string' ? Buffer.byteLength(body) : body.length),
     'x-github-request-id': `req-${++requestSeq}`,
     'x-oauth-scopes': 'repo, read:org',
     ...(extra ?? {}),
@@ -811,12 +817,12 @@ function issueJson(repo: Repo, issue: Issue): Record<string, unknown> {
 // Serialized single-issue GET responses, keyed by repo + issue + viewVersion.
 // viewVersion bumps on any mutation that can change an issue's JSON (create,
 // patch, close, comment, label change); a stale key just misses, never lies.
-const issueJsonCache = new Map<string, string>();
-function cachedIssueJson(repo: Repo, issue: Issue): string {
+const issueJsonCache = new Map<string, Buffer>();
+function cachedIssueJson(repo: Repo, issue: Issue): Buffer {
   const key = `issue|${repo.id}|${issue.number}|${repo.viewVersion}`;
   const hit = issueJsonCache.get(key);
   if (hit !== undefined) return hit;
-  const body = JSON.stringify(issueJson(repo, issue));
+  const body = Buffer.from(JSON.stringify(issueJson(repo, issue)), 'utf8');
   if (issueJsonCache.size >= 1024) issueJsonCache.clear();
   issueJsonCache.set(key, body);
   return body;
@@ -3048,6 +3054,9 @@ async function main(): Promise<void> {
   const server = createServer((req, res) => {
     void handleRequest(req, res);
   });
+  // Small request/response ping-pong: never let Nagle hold a tiny reply waiting
+  // for an ACK (matters more under gVisor, where timers are coarser).
+  server.on('connection', (socket) => socket.setNoDelay(true));
   server.listen(listenPort, '127.0.0.1', () => {
     const address = server.address();
     const port = typeof address === 'object' && address !== null ? address.port : listenPort;
