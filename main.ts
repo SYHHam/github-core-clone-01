@@ -2,7 +2,14 @@
 // Node 22, standard library only, no git binary, no external service.
 // Surfaces: git smart HTTP (upload-pack v2 / receive-pack v0), REST v3,
 // GraphQL v4, MCP (Streamable HTTP). In-memory store, deterministic state.
-import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
+// Transport: hand-rolled HTTP/1.1 over node:net (no node:http). The suite's
+// workloads are thousands of tiny sequential requests; node:http's per-request
+// IncomingMessage/ServerResponse/stream machinery costs more CPU than the
+// handlers themselves, and that cost is amplified under gVisor. The parser
+// below speaks the same HTTP/1.1 the clients do (Content-Length, chunked,
+// Expect: 100-continue, keep-alive, pipelining) and hands the handlers a
+// pre-read body, so every handler runs synchronously to completion.
+import { createServer, type Socket } from 'node:net';
 import { createHash } from 'node:crypto';
 import { deflateSync, inflateSync } from 'node:zlib';
 import { Buffer } from 'node:buffer';
@@ -689,18 +696,23 @@ const IS_LIFECYCLE = ENV_URL.length > 0;
 const AUTH_TOKEN = TOKEN.length > 0 ? TOKEN : IS_LIFECYCLE ? '' : 'test-token';
 let requestSeq = 0;
 
-function readBody(req: IncomingMessage): Promise<Buffer> {
-  return new Promise((resolve, reject) => {
-    const chunks: Buffer[] = [];
-    req.on('data', (c: Buffer) => chunks.push(c));
-    req.on('end', () => resolve(Buffer.concat(chunks)));
-    req.on('error', reject);
-  });
+// Minimal request/response shapes the handlers need. The raw transport
+// builds these per request; nothing here depends on node:http anymore.
+interface ReqLike {
+  method: string;
+  url: string;
+  headers: Record<string, string | undefined>;
 }
-function sendJson(res: ServerResponse, status: number, value: unknown, extra?: Record<string, string>): void {
+interface ResLike {
+  headersSent: boolean;
+  writeHead(status: number, headers?: Record<string, string>): void;
+  end(body?: Buffer | string): void;
+}
+
+function sendJson(res: ResLike, status: number, value: unknown, extra?: Record<string, string>): void {
   sendJsonText(res, status, JSON.stringify(value), extra);
 }
-function sendJsonText(res: ServerResponse, status: number, bodyIn: string | Buffer, extra?: Record<string, string>): void {
+function sendJsonText(res: ResLike, status: number, bodyIn: string | Buffer, extra?: Record<string, string>): void {
   // Encode once: a single Buffer gives the exact length and avoids a second
   // UTF-8 pass inside res.end().
   const body: Buffer = typeof bodyIn === 'string' ? Buffer.from(bodyIn, 'utf8') : bodyIn;
@@ -715,7 +727,7 @@ function sendJsonText(res: ServerResponse, status: number, bodyIn: string | Buff
   res.writeHead(status, headers);
   res.end(body);
 }
-function sendNoContent(res: ServerResponse): void {
+function sendNoContent(res: ResLike): void {
   res.writeHead(204, {
     'content-type': 'application/json; charset=utf-8',
     'x-github-request-id': `req-${++requestSeq}`,
@@ -723,10 +735,10 @@ function sendNoContent(res: ServerResponse): void {
   });
   res.end();
 }
-function sendError(res: ServerResponse, status: number, message: string): void {
+function sendError(res: ResLike, status: number, message: string): void {
   sendJson(res, status, { message });
 }
-function isAuthorized(req: IncomingMessage): boolean {
+function isAuthorized(req: ReqLike): boolean {
   if (AUTH_TOKEN.length === 0) return false;
   return req.headers.authorization === `Bearer ${AUTH_TOKEN}`;
 }
@@ -842,6 +854,35 @@ function cachedIssueJson(repo: Repo, issue: Issue): Buffer {
   issueJsonCache.set(key, body);
   return body;
 }
+// Hand-built serialization of one issue, byte-identical to
+// JSON.stringify(issueJson(repo, issue)) — same keys, same order, same
+// escaping (JSON.stringify per string field) — but without building the
+// nested object graph and re-walking it. Hot path: POST /issues (the write
+// workload creates 200 issues back to back) and PATCH /issues/{n}.
+function issueJsonText(repo: Repo, issue: Issue): string {
+  const userId = issue.user === VIEWER_LOGIN ? VIEWER_ID : 0;
+  let labels = '';
+  for (let i = 0; i < issue.labels.length; i++) {
+    const n = issue.labels[i] as string;
+    const l = repo.labels.get(n);
+    const name = l !== undefined ? l.name : n;
+    const color = l !== undefined ? l.color : '000000';
+    const desc = l !== undefined ? l.description : '';
+    if (i > 0) labels += ',';
+    labels += `{"name":${JSON.stringify(name)},"color":${JSON.stringify(color)},"description":${JSON.stringify(desc)}}`;
+  }
+  const comments = (repo.comments.get(issue.number) ?? []).length;
+  const closedAt = issue.state === 'closed' ? `"${FIXED_DATE}"` : 'null';
+  return (
+    `{"id":${issue.id},"node_id":${JSON.stringify(issueGlobalId(repo, issue))},"number":${issue.number},` +
+    `"title":${JSON.stringify(issue.title)},"body":${JSON.stringify(issue.body)},"state":${JSON.stringify(issue.state)},` +
+    `"user":{"login":${JSON.stringify(issue.user)},"id":${userId},"type":"User","avatar_url":"","html_url":"https://github.com/${issue.user}"},` +
+    `"labels":[${labels}],"comments":${comments},"created_at":"${FIXED_DATE}","updated_at":"${FIXED_DATE}","closed_at":${closedAt},` +
+    `"html_url":"https://github.com/${repo.owner}/${repo.name}/issues/${issue.number}",` +
+    `"url":"/api/v3/repos/${repo.owner}/${repo.name}/issues/${issue.number}",` +
+    `"repository_url":"/api/v3/repos/${repo.owner}/${repo.name}"}`
+  );
+}
 function parseIdent(line: string): { name: string; email: string } {
   const m = /^(.+) <([^>]+)> \d+ [+-]\d{4}$/.exec(line);
   if (m) return { name: m[1], email: m[2] };
@@ -932,7 +973,7 @@ function stripBranchPrefix(ref: string): string {
 }
 
 // ---------------------------------------------------------------- REST v3
-async function handleRest(req: IncomingMessage, res: ServerResponse, segments: string[], query: URLSearchParams, bodyBuf: Buffer): Promise<void> {
+async function handleRest(req: ReqLike, res: ResLike, segments: string[], query: URLSearchParams, bodyBuf: Buffer): Promise<void> {
   const method = req.method ?? 'GET';
   const host = req.headers.host ?? '127.0.0.1';
   const baseUrl = `http://${host}`;
@@ -1251,7 +1292,7 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, segments: s
             if (!repo.labels.has(n)) return sendError(res, 422, `Label does not exist: ${n}`);
           }
           const issue = createIssueInternal(repo, title, asString(body.body) ?? '', labelNames);
-          return sendJson(res, 201, issueJson(repo, issue));
+          return sendJsonText(res, 201, issueJsonText(repo, issue));
         }
         return sendError(res, 404, 'Not Found');
       }
@@ -1269,7 +1310,7 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, segments: s
           if (asString(body.body) !== undefined) issue.body = asString(body.body) as string;
           if (body.state === 'open' || body.state === 'closed') issue.state = body.state;
           repo.viewVersion++;
-          return sendJson(res, 200, issueJson(repo, issue));
+          return sendJsonText(res, 200, issueJsonText(repo, issue));
         }
         return sendError(res, 404, 'Not Found');
       }
@@ -1419,7 +1460,7 @@ function refsKey(repo: Repo): string {
 }
 
 // ---------------------------------------------------------------- git smart HTTP
-function sendGit(res: ServerResponse, status: number, contentType: string, body: Buffer): void {
+function sendGit(res: ResLike, status: number, contentType: string, body: Buffer): void {
   res.writeHead(status, { 'content-type': contentType, 'content-length': String(body.length) });
   res.end(body);
 }
@@ -1681,7 +1722,7 @@ function buildFetchV0Response(repo: Repo, section1: string[], section2: string[]
   parts.push(FLUSH);
   return Buffer.concat(parts);
 }
-async function handleGit(req: IncomingMessage, res: ServerResponse, segments: string[], query: URLSearchParams, bodyBuf: Buffer): Promise<void> {
+async function handleGit(req: ReqLike, res: ResLike, segments: string[], query: URLSearchParams, bodyBuf: Buffer): Promise<void> {
   const method = req.method ?? 'GET';
   const owner = segments[0];
   const repoName = segments[1].slice(0, -4); // strip '.git'
@@ -2628,7 +2669,7 @@ function executeGraphQL(query: string, variables: Record<string, unknown>): { da
     return { data: null, errors: [{ message: e instanceof Error ? e.message : String(e) }] };
   }
 }
-async function handleGraphQL(req: IncomingMessage, res: ServerResponse, bodyBuf: Buffer): Promise<void> {
+async function handleGraphQL(req: ReqLike, res: ResLike, bodyBuf: Buffer): Promise<void> {
   const parsed = parseJsonBody(bodyBuf);
   if (!parsed.ok) {
     return sendJson(res, 400, { errors: [{ message: 'Problems parsing JSON' }] });
@@ -2884,7 +2925,7 @@ function callMcpTool(name: string, args: Record<string, unknown>): Record<string
   }
   return mcpToolFailure(`Unknown tool: ${name}`);
 }
-async function handleMcp(req: IncomingMessage, res: ServerResponse, bodyBuf: Buffer): Promise<void> {
+async function handleMcp(req: ReqLike, res: ResLike, bodyBuf: Buffer): Promise<void> {
   const method = req.method ?? 'GET';
   if (method === 'GET') return sendError(res, 405, 'Method not allowed');
   if (method !== 'POST') return sendError(res, 405, 'Method not allowed');
@@ -2968,10 +3009,12 @@ async function handleMcp(req: IncomingMessage, res: ServerResponse, bodyBuf: Buf
 }
 
 // ---------------------------------------------------------------- dispatcher
-async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise<void> {
+// The transport hands us the whole body already read; handlers never wait
+// on a stream. Everything below runs synchronously to completion.
+async function handleRequest(req: ReqLike, res: ResLike, bodyBuf: Buffer): Promise<void> {
   try {
-    const method = req.method ?? 'GET';
-    const rawUrl = req.url ?? '/';
+    const method = req.method;
+    const rawUrl = req.url;
     // Lean URL split: the suite sends clean absolute paths, so parse by hand
     // instead of paying for the URL constructor on every request. Fall back to
     // URL only for dot segments / fragments, which URL normalizes away.
@@ -3007,15 +3050,6 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
           return s;
         }
       });
-    // GETs here never carry a body (no content-length / transfer-encoding):
-    // skip attaching body listeners and waiting for 'end' on every read.
-    const clen = req.headers['content-length'];
-    const bodyBuf =
-      (method === 'GET' || method === 'HEAD') &&
-      req.headers['transfer-encoding'] === undefined &&
-      (clen === undefined || clen === '0')
-        ? EMPTY_BODY
-        : await readBody(req);
 
     // GET /healthz
     if (segments.length === 1 && segments[0] === 'healthz') {
@@ -3049,6 +3083,264 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
   }
 }
 
+// ---------------------------------------------------------------- raw HTTP/1.1 transport
+// Hand-rolled, minimal but complete for the clients that talk to this forge
+// (undici, curl/git, gh): request line + headers, Content-Length bodies,
+// chunked bodies, Expect: 100-continue, keep-alive, pipelining. Requests on
+// one socket are handled strictly in arrival order — the store is single
+// threaded anyway, so this matches node:http's effective ordering here.
+// Responses go out as ONE socket.write (head + body) with an explicit
+// Content-Length (computed here when a handler did not set one), so the
+// client never sees chunked framing and never waits on a second flush.
+const STATUS_TEXT: Record<number, string> = {
+  200: 'OK',
+  201: 'Created',
+  202: 'Accepted',
+  204: 'No Content',
+  400: 'Bad Request',
+  401: 'Unauthorized',
+  404: 'Not Found',
+  405: 'Method Not Allowed',
+  422: 'Unprocessable Entity',
+  500: 'Internal Server Error',
+};
+const MAX_BODY = 64 * 1024 * 1024;
+const MAX_HEAD = 64 * 1024;
+
+class RawResponse implements ResLike {
+  headersSent = false;
+  private status = 200;
+  private headers: Record<string, string> = {};
+  private ended = false;
+  private sock: Socket;
+  private version: string;
+  private keepAlive: boolean;
+  private isHead: boolean;
+  constructor(sock: Socket, version: string, keepAlive: boolean, isHead: boolean) {
+    this.sock = sock;
+    this.version = version;
+    this.keepAlive = keepAlive;
+    this.isHead = isHead;
+  }
+  writeHead(status: number, headers?: Record<string, string>): void {
+    if (this.ended) return;
+    this.status = status;
+    if (headers !== undefined) {
+      for (const k of Object.keys(headers)) this.headers[k] = headers[k] as string;
+    }
+    this.headersSent = true;
+  }
+  end(body?: Buffer | string): void {
+    if (this.ended) return;
+    this.ended = true;
+    const buf: Buffer =
+      body === undefined ? EMPTY_BODY : typeof body === 'string' ? Buffer.from(body, 'utf8') : body;
+    if (this.headers['content-length'] === undefined) this.headers['content-length'] = String(buf.length);
+    let head = `${this.version} ${this.status} ${STATUS_TEXT[this.status] ?? ''}\r\n`;
+    for (const k of Object.keys(this.headers)) head += `${k}: ${this.headers[k]}\r\n`;
+    head += `connection: ${this.keepAlive ? 'keep-alive' : 'close'}\r\n\r\n`;
+    const headBuf = Buffer.from(head, 'ascii');
+    if (this.isHead || buf.length === 0) {
+      this.sock.write(headBuf);
+    } else {
+      this.sock.write(Buffer.concat([headBuf, buf]));
+    }
+    if (!this.keepAlive) this.sock.end();
+  }
+}
+
+interface PendingRequest {
+  req: ReqLike;
+  body: Buffer;
+  version: string;
+  keepAlive: boolean;
+  isHead: boolean;
+}
+
+function attachSocket(sock: Socket): void {
+  // Small request/response ping-pong: never let Nagle hold a tiny reply waiting
+  // for an ACK (matters more under gVisor, where timers are coarser).
+  sock.setNoDelay(true);
+  let data = Buffer.alloc(0);
+  let busy = false;
+  let clientEnded = false;
+  let continueSent = false;
+  const pending: PendingRequest[] = [];
+
+  const pump = (): void => {
+    if (busy) return;
+    const item = pending.shift();
+    if (item === undefined) {
+      if (clientEnded) sock.end();
+      return;
+    }
+    busy = true;
+    const res = new RawResponse(sock, item.version, item.keepAlive, item.isHead);
+    void handleRequest(item.req, res, item.body)
+      .catch((e) => {
+        console.error('[entry] request error:', e instanceof Error ? e.stack ?? e.message : String(e));
+        if (!res.headersSent) {
+          try {
+            sendError(res, 500, 'Internal Server Error');
+          } catch {
+            // Socket may already be gone; nothing left to do.
+          }
+        }
+      })
+      .finally(() => {
+        busy = false;
+        if (!item.keepAlive) {
+          sock.end();
+          return;
+        }
+        if (clientEnded && pending.length === 0) {
+          sock.end();
+          return;
+        }
+        pump();
+      });
+  };
+
+  // Parse one complete request off the front of `data` and queue it.
+  // Returns false when more bytes are needed (or the socket was destroyed).
+  const tryParse = (): boolean => {
+    const headEnd = data.indexOf('\r\n\r\n');
+    if (headEnd < 0) {
+      if (data.length > MAX_HEAD) sock.destroy();
+      return false;
+    }
+    const headText = data.toString('ascii', 0, headEnd);
+    const lines = headText.split('\r\n');
+    const first = lines[0] as string;
+    const sp1 = first.indexOf(' ');
+    const sp2 = first.indexOf(' ', sp1 + 1);
+    if (sp1 < 0 || sp2 < 0) {
+      sock.destroy();
+      return false;
+    }
+    const method = first.slice(0, sp1);
+    let target = first.slice(sp1 + 1, sp2);
+    const version = first.slice(sp2 + 1);
+    const headers: Record<string, string | undefined> = {};
+    for (let i = 1; i < lines.length; i++) {
+      const line = lines[i] as string;
+      const colon = line.indexOf(':');
+      if (colon < 0) continue;
+      const name = line.slice(0, colon).trim().toLowerCase();
+      const value = line.slice(colon + 1).trim();
+      const prev = headers[name];
+      headers[name] = prev === undefined ? value : `${prev}, ${value}`;
+    }
+    // Absolute-form target (a forwarding proxy): strip scheme + authority.
+    if (target.startsWith('http://') || target.startsWith('https://')) {
+      const slash = target.indexOf('/', target.indexOf('://') + 3);
+      target = slash >= 0 ? target.slice(slash) : '/';
+    }
+    const conn = (headers.connection ?? '').toLowerCase();
+    const is11 = version !== 'HTTP/1.0';
+    const keepAlive = is11 ? !conn.includes('close') : conn.includes('keep-alive');
+    const wantsContinue = (headers.expect ?? '').toLowerCase().includes('100-continue');
+    const chunked = (headers['transfer-encoding'] ?? '').toLowerCase().includes('chunked');
+    const bodyStart = headEnd + 4;
+    let body: Buffer;
+    let next: number;
+    if (chunked) {
+      let off = bodyStart;
+      const parts: Buffer[] = [];
+      let done = false;
+      while (!done) {
+        const lineEnd = data.indexOf('\r\n', off);
+        if (lineEnd < 0) {
+          if (wantsContinue && !continueSent) {
+            sock.write('HTTP/1.1 100 Continue\r\n\r\n');
+            continueSent = true;
+          }
+          return false;
+        }
+        const sizeLine = data.toString('ascii', off, lineEnd).split(';')[0] as string;
+        const size = parseInt(sizeLine.trim(), 16);
+        if (Number.isNaN(size) || size < 0 || size > MAX_BODY) {
+          sock.destroy();
+          return false;
+        }
+        if (size === 0) {
+          let t = lineEnd + 2;
+          for (;;) {
+            const e2 = data.indexOf('\r\n', t);
+            if (e2 < 0) {
+              if (wantsContinue && !continueSent) {
+                sock.write('HTTP/1.1 100 Continue\r\n\r\n');
+                continueSent = true;
+              }
+              return false;
+            }
+            if (e2 === t) {
+              next = e2 + 2;
+              done = true;
+              break;
+            }
+            t = e2 + 2;
+          }
+          continue;
+        }
+        const chunkStart = lineEnd + 2;
+        if (data.length < chunkStart + size + 2) {
+          if (wantsContinue && !continueSent) {
+            sock.write('HTTP/1.1 100 Continue\r\n\r\n');
+            continueSent = true;
+          }
+          return false;
+        }
+        parts.push(data.subarray(chunkStart, chunkStart + size));
+        off = chunkStart + size + 2;
+      }
+      body = parts.length === 0 ? EMPTY_BODY : parts.length === 1 ? (parts[0] as Buffer) : Buffer.concat(parts);
+    } else {
+      const clen = Number(headers['content-length'] ?? '0');
+      if (!Number.isFinite(clen) || clen < 0 || clen > MAX_BODY) {
+        sock.destroy();
+        return false;
+      }
+      if (data.length < bodyStart + clen) {
+        // curl (git) waits for 100-continue before sending a >1 KiB body;
+        // answer now or every push stalls ~1 s on the client's timer.
+        if (wantsContinue && !continueSent) {
+          sock.write('HTTP/1.1 100 Continue\r\n\r\n');
+          continueSent = true;
+        }
+        return false;
+      }
+      body = clen === 0 ? EMPTY_BODY : data.subarray(bodyStart, bodyStart + clen);
+      next = bodyStart + clen;
+    }
+    data = data.subarray(next);
+    continueSent = false;
+    pending.push({
+      req: { method, url: target, headers },
+      body,
+      version: is11 ? 'HTTP/1.1' : 'HTTP/1.0',
+      keepAlive,
+      isHead: method === 'HEAD',
+    });
+    return true;
+  };
+
+  sock.on('data', (chunk: Buffer) => {
+    data = data.length === 0 ? chunk : Buffer.concat([data, chunk]);
+    while (tryParse()) {
+      // Keep draining complete (pipelined) requests already in the buffer.
+    }
+    pump();
+  });
+  sock.on('end', () => {
+    clientEnded = true;
+    if (!busy && pending.length === 0) sock.end();
+  });
+  sock.on('error', () => {
+    sock.destroy();
+  });
+}
+
 // ---------------------------------------------------------------- lifecycle
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -3068,12 +3360,9 @@ async function pollDone(envUrl: string): Promise<void> {
 }
 async function main(): Promise<void> {
   const listenPort = IS_LIFECYCLE ? 0 : Number(process.env.PORT ?? '0');
-  const server = createServer((req, res) => {
-    void handleRequest(req, res);
+  const server = createServer((sock) => {
+    attachSocket(sock);
   });
-  // Small request/response ping-pong: never let Nagle hold a tiny reply waiting
-  // for an ACK (matters more under gVisor, where timers are coarser).
-  server.on('connection', (socket) => socket.setNoDelay(true));
   server.listen(listenPort, '127.0.0.1', () => {
     const address = server.address();
     const port = typeof address === 'object' && address !== null ? address.port : listenPort;
