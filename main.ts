@@ -685,6 +685,8 @@ function sendJson(res: ServerResponse, status: number, value: unknown, extra?: R
 function sendJsonText(res: ServerResponse, status: number, body: string, extra?: Record<string, string>): void {
   const headers: Record<string, string> = {
     'content-type': 'application/json; charset=utf-8',
+    // Explicit length: no chunked framing, the client can allocate exactly.
+    'content-length': String(Buffer.byteLength(body)),
     'x-github-request-id': `req-${++requestSeq}`,
     'x-oauth-scopes': 'repo, read:org',
     ...(extra ?? {}),
